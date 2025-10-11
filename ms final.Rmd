@@ -1,0 +1,838 @@
+---
+title: "ms final project"
+author: "RanChen"
+date: "2024-11-19"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+
+Data input
+```{r}
+library(haven)
+library(e1071)
+library(survey)
+library(ggplot2)
+library(tidyr)
+library(dplyr)
+library(randomForest)
+library(pROC)
+library(xgboost)
+library(caret)
+
+
+
+
+
+data1<-read_xpt("GLU_L.XPT")
+data2<-read_xpt("DEMO_L.XPT")
+data3<-read_xpt("SMQ_L.XPT")
+data4<-read_xpt("GHB_L.XPT")#HBA1C
+data5<-read_xpt("PAQ_L.XPT")
+data6<-read_xpt("DIQ_L.XPT")
+data7<-read_xpt("ALQ_L.XPT")
+data8<-read_xpt("INQ_L.XPT")
+data9<-read_xpt("SLQ_L.XPT")
+data10<-read_xpt("BMX_L.XPT")
+ 
+
+data_list<-list(data1, data2, data3, data4, data5, data6,data7,data8,data9,data10)
+
+merged_data<-Reduce(function(x, y) merge(x, y, by = "SEQN"), data_list)
+
+#colnames(merged_data)
+
+#delete the columns we don't need
+merged_data<-merged_data %>% select(-"DMDYRUSR", - "DMQMILIZ", -"RIDAGEMN",  -"RIDEXAGM", -"RIDEXMON", -"RIDSTATR", -"SDDSRVYR", -"SEQN", -"DIQ160", -"DIQ180", -"DIQ050", -"DID060", -"DIQ060U", -"DIQ070", -"LBXGLU", -"SMD630", -"SMD641", -"SMD650", -"SMQ020",  -"ALQ130", -"ALQ142", -"ALQ151", -"ALQ170", -"ALQ270", -"ALQ280", -"INDFMMPC", -"INDFMMPI", -"SLQ310", -"SLQ330", -"BMDBMIC", -"BMDSTATS", -"BMIARMC", -"BMIARML", -"BMIHEAD", -"BMIHIP", -"BMIHT", -"BMILEG", -"BMIRECUM", -"BMIWAIST", -"BMIWT", -"DID040", -"DMDHREDZ",-"DMDHRGND", -"DMDHRMAZ",-"DMDHSEDZ")
+
+#nrow(merged_data)
+#head(merged_data)
+```
+
+
+Data Cleaning
+```{r}
+
+cleaned_data <- merged_data %>%
+  filter(!is.na(WTMEC2YR)) %>%
+  filter(RIDAGEYR >= 20) %>%
+  filter(RIDEXPRG != 1 | is.na(RIDEXPRG))
+
+
+
+cleaned_data <- cleaned_data %>%
+    mutate(
+      diabetes = ifelse(DIQ010 == 1 | LBDGLUSI >= 7, 1, 0),
+      prediabetes = ifelse((LBDGLUSI >= 5.6 & LBDGLUSI < 7), 1, 0),
+      nondiabetes = ifelse(LBDGLUSI < 5.6 & DIQ010 != 1, 1, 0)
+    )
+
+cleaned_data <- cleaned_data %>%
+    mutate(
+      diabetes = replace_na(diabetes, 0),
+      prediabetes = replace_na(prediabetes, 0),
+      nondiabetes = replace_na(nondiabetes, 0)
+    )
+data<-cleaned_data %>% select(-"DIQ010",-"LBDGLUSI")
+
+
+#age
+diff_rows <- data[!is.na(data$DMDHRAGZ) & !is.na(data$RIDAGEYR) & data$DMDHRAGZ != data$RIDAGEYR, ]
+#print(head(diff_rows[, c("DMDHRAGZ", "RIDAGEYR")]))
+#nrow(diff_rows)
+data$age<-coalesce(data$RIDAGEYR, data$DMDHRAGZ)
+data<- data%>%select(-"DMDHRAGZ", -"RIDAGEYR")
+
+
+#sum(data$nondiabetes)
+
+#colnames(data)
+```
+
+
+
+design
+```{r}
+library(survey)
+
+
+interview_data<-data %>% select( "RIAGENDR","RIDRETH1","RIDRETH3","DMDBORN4","DMDEDUC2","DMDMARTZ", 
+                                 "DMDHHSIZ","WTINT2YR","WTMEC2YR","SDMVSTRA",
+                                 "SDMVPSU","SMQ040","PAD790Q","PAD790U","PAD800",
+                                 "PAD810Q","PAD810U","PAD820","PAD680","ALQ111","ALQ121", "IND310","SLD012",
+                                 "SLD013" , "diabetes","prediabetes" ,"nondiabetes","age")
+exam_data<- data %>% select("WTSAF2YR","RIDRETH1", "RIDRETH3", "DMDBORN4", "DMDEDUC2", "DMDMARTZ", 
+                             "DMDHHSIZ", "WTMEC2YR", "SDMVSTRA",
+                            "SDMVPSU", "INDFMPIR", "WTPH2YR", "LBXGH", "BMXWT", "BMXRECUM", "BMXHEAD", "BMXHT", "BMXBMI",
+                            "BMXLEG", "BMXARML", "BMXARMC", "BMXWAIST", "BMXHIP", "diabetes", "prediabetes", "nondiabetes","age")
+
+
+
+interview_design <- svydesign(
+  id = ~SDMVPSU,
+  strata = ~SDMVSTRA,
+  weights = ~WTINT2YR,
+  data = interview_data,
+  nest = TRUE
+)
+
+exam_design <- svydesign(
+  id = ~SDMVPSU,
+  strata = ~SDMVSTRA,
+  weights = ~WTMEC2YR,
+  data = exam_data,
+  nest = TRUE
+)
+```
+
+
+EDA
+```{r}
+#diabetes barplot
+diabetes_status <- svytable(~diabetes, interview_design)
+prediabetes_status <- svytable(~prediabetes, interview_design)
+nondiabetes_status <- svytable(~nondiabetes, interview_design)
+
+status_df <- data.frame(
+  Status = c("Diabetes", "Prediabetes", "Non-diabetes"),
+  Count = c(diabetes_status[2], prediabetes_status[2], nondiabetes_status[2])
+)
+
+status_df$Percentage <- status_df$Count / sum(status_df$Count) * 100
+
+ggplot(status_df, aes(x = Status, y = Count, fill = Status)) +
+  geom_bar(stat = "identity") +
+  geom_text(aes(label = sprintf("%.1f%%", Percentage)), 
+            position = position_dodge(width = 0.9), 
+            vjust = 0) +
+  scale_fill_manual(values = c("#FF9999", "#66B2FF", "#99FF99")) +
+  labs(title = "Distribution of Diabetes Status (Weighted)") +
+  theme_minimal()
+
+
+
+#violin plot
+#age vs status
+age_data <- data.frame(
+  Age = interview_data$age,
+  Weight = interview_data$WTINT2YR,
+  Status = case_when(
+    interview_data$diabetes == 1 ~ "Diabetes",
+    interview_data$prediabetes == 1 ~ "Prediabetes",
+    TRUE ~ "Non-diabetes"
+  )
+)
+
+ggplot(age_data, aes(x = Status, y = Age, fill = Status, weight = Weight)) +
+  geom_violin(trim = FALSE) +
+  geom_boxplot(width = 0.1, alpha = 0.2) +
+  scale_fill_manual(values = c("#FF9999", "#66B2FF", "#99FF99")) +
+  labs(title = "Age Distribution by Diabetes Status (Weighted)",
+       y = "Age") +
+  theme_minimal()
+
+#gender vs status
+diabetes_by_gender <- svytable(~RIAGENDR + diabetes, interview_design)
+prediabetes_by_gender <- svytable(~RIAGENDR + prediabetes, interview_design)
+nondiabetes_by_gender <- svytable(~RIAGENDR + nondiabetes, interview_design)
+
+gender_status_df <- data.frame(
+  Gender = rep(c("Male", "Female"), 3),
+  Status = rep(c("Diabetes", "Prediabetes", "Non-diabetes"), each = 2),
+  Count = c(
+    diabetes_by_gender[1,2], diabetes_by_gender[2,2],
+    prediabetes_by_gender[1,2], prediabetes_by_gender[2,2],
+    nondiabetes_by_gender[1,2], nondiabetes_by_gender[2,2]
+  )
+)
+
+gender_status_df <- gender_status_df %>%
+  group_by(Gender) %>%
+  mutate(Percentage = Count / sum(Count) * 100)
+
+ggplot(gender_status_df, aes(x = Gender, y = Percentage, fill = Status)) +
+  geom_bar(stat = "identity") +
+  scale_fill_manual(values = c("#FF9999", "#66B2FF", "#99FF99")) +
+  geom_text(aes(label = sprintf("%.1f%%", Percentage)),
+            position = position_stack(vjust = 0.5)) +
+  labs(title = "Distribution of Diabetes Status by Gender (Weighted)",
+       x = "Gender",
+       y = "Percentage") +
+  theme_minimal()
+
+
+
+
+#bmi distribution
+bmi_data <- data.frame(
+  BMI = exam_data$BMXBMI,
+  Weight = exam_data$WTMEC2YR,
+  Status = case_when(
+    exam_data$diabetes == 1 ~ "Diabetes",
+    exam_data$prediabetes == 1 ~ "Prediabetes",
+    TRUE ~ "Non-diabetes"
+  )
+)
+
+ggplot(bmi_data, aes(x = BMI, fill = Status, weight = Weight)) +
+  geom_density(alpha = 0.5) +
+  scale_fill_manual(values = c("#FF9999", "#66B2FF", "#99FF99")) +
+  labs(title = "BMI Distribution by Diabetes Status (Weighted)",
+       x = "BMI",
+       y = "Density") +
+  theme_minimal()
+```
+
+
+
+Variable Selection
+Interview Data
+```{r}
+#nrow(interview_data)
+
+#unique(data$SMQ040)
+interview_data <- interview_data %>%
+  mutate(
+    smoking = case_when(
+      SMQ040 %in% c(1, 2) ~ 1,
+      SMQ040 == 3 | is.na(SMQ040) ~ 0
+    )
+  )
+
+
+interview_data <- interview_data %>%
+  mutate(
+    vigorous_time = case_when(
+      PAD810U == 2 ~ PAD810Q * 60 * PAD820,
+      PAD810U == 1 ~ PAD810Q * PAD820,
+      TRUE ~ NA_real_
+    )
+  )
+
+interview_data <- interview_data %>%
+  mutate(
+    moderate_time = case_when(
+      PAD790U == "D" ~ PAD790Q *PAD800,
+      PAD790U == "W" ~ PAD790Q *PAD800 /7,
+      PAD790U == "M" ~ PAD790Q *PAD800 /30,
+      PAD790U == "Y" ~ PAD790Q *PAD800 /360,
+      TRUE ~ 0
+    )
+  )
+interview_data <- interview_data %>%
+  mutate(
+    vigorous_time = case_when(
+      PAD810U == "D" ~ PAD810Q *PAD820,
+      PAD810U == "W" ~ PAD810Q *PAD820 /7,
+      PAD810U == "M" ~ PAD810Q *PAD820 /30,
+      PAD810U == "Y" ~ PAD810Q *PAD820 /360,
+      TRUE ~ 0
+    )
+  )
+
+#head(interview_data)
+
+  
+#head(interview_data)
+
+interview_data <- interview_data %>%
+  mutate(
+    drinking = case_when(
+      ALQ111 == 1 ~ 1,
+      ALQ111 == 2 ~ 0,
+      ALQ111 == 9 | is.na(ALQ111) ~ 0
+    )
+  )
+interview_data <- interview_data %>%
+  mutate(ALQ121 = replace_na(ALQ121, 0))
+
+
+
+
+interview_data <- interview_data %>%
+  mutate(IND310 = case_when(
+    IND310 %in% c(77, 99) ~ NA_real_,
+    TRUE ~ IND310
+  ))
+
+#unique(interview_data$IND310)
+interview_data <- interview_data %>% select(-"SMQ040", -"PAD790Q", -"PAD790U", -"PAD800", -"PAD810Q", -"PAD810U", -"PAD820")
+#nrow(interview_data)
+#nrow(interview_data %>% select(-IND310))
+
+```
+Random Forest
+```{r}
+weights <- weights(interview_design)
+rf_data <- interview_data %>%
+  select("RIAGENDR", "RIDRETH1", "RIDRETH3",  "DMDBORN4", "DMDEDUC2", "DMDMARTZ", "DMDHHSIZ", "PAD680", "ALQ111", "ALQ121", "IND310", "SLD012", "SLD013", "age", "smoking", "vigorous_time", "moderate_time",  "drinking", "diabetes", "prediabetes", "nondiabetes")
+#head(rf_predictors)
+# 
+# 
+# # set.seed(100)
+# # rf_diabetes<-randomForest(as.factor(rf_data$diabetes)~.-prediabetes-nondiabetes,data=rf_data,mtry=12,ntree=1000,na.action = na.roughfix)
+# # plot(rf_diabetes)
+# # rf_diabetes<-randomForest(as.factor(rf_data$prediabetes)~.-diabetes-nondiabetes,data=rf_data,mtry=12,ntree=1000,na.action = na.roughfix)
+# # plot(rf_prediabetes)  
+# # rf_nondiabetes<-randomForest(as.factor(rf_data$nondiabetes)~.-prediabetes-diabetes,data=rf_data,mtry=12,ntree=1000,na.action = na.roughfix)
+# # plot(rf_nondiabetes)  
+# 
+
+# rf_diabetes <- randomForest(
+#   factor(diabetes) ~ . - prediabetes - nondiabetes,
+#   data = rf_data,
+#   ntree = 250,
+#   weights = weights(interview_design),  # 使用survey weights
+#   importance = TRUE,
+#   na.action = na.roughfix
+# )
+# 
+# rf_prediabetes <- randomForest(
+#   factor(prediabetes) ~ . - diabetes - nondiabetes,
+#   data = rf_data,
+#   ntree = 250,
+#   weights = weights(interview_design),
+#   importance = TRUE,
+#   na.action = na.roughfix
+# )
+# 
+# rf_nondiabetes <- randomForest(
+#   factor(nondiabetes) ~ . - diabetes - prediabetes,
+#   data = rf_data,
+#   ntree = 250,
+#   weights = weights(interview_design),
+#   importance = TRUE,
+#   na.action = na.roughfix
+# )
+# 
+
+# imp_diabetes <- importance(rf_diabetes)
+# varImpPlot(rf_diabetes, main="Variable Importance for Diabetes")
+# 
+# imp_prediabetes <- importance(rf_prediabetes)
+# varImpPlot(rf_prediabetes, main="Variable Importance for Prediabetes")
+# 
+# imp_nondiabetes <- importance(rf_nondiabetes)
+# varImpPlot(rf_nondiabetes, main="Variable Importance for Non-diabetes")
+
+
+
+pca_data<-rf_data %>% select(-"IND310")
+
+```
+PCA
+```{r}
+interview_data <- interview_data %>%
+  mutate(DMDMARTZ = case_when(
+    DMDMARTZ %in% c(77, 99) ~ 0,
+    TRUE ~ DMDMARTZ
+  ))
+interview_data <- interview_data %>%
+  mutate(DMDEDUC2 = case_when(
+    DMDEDUC2 %in% c(9) ~ 0,
+    TRUE ~ DMDEDUC2
+  ))
+library(PCAmixdata)
+df <- as.data.frame(interview_data)
+df[is.na(df)] <- 0
+num_vars <- c("age", "vigorous_time", "moderate_time",  "DMDHHSIZ", "ALQ121",  "SLD012", "SLD013", "PAD680")
+cat_vars <- c("RIAGENDR","RIDRETH1", "RIDRETH3", "DMDBORN4", "DMDEDUC2", "DMDMARTZ", "ALQ111", "diabetes", "prediabetes", "nondiabetes", "smoking", "drinking" )
+
+X1 <- df[, num_vars]
+X2 <- df[, cat_vars]
+X2 <- data.frame(lapply(X2, as.factor))
+#summary(X2)
+
+library(PCAmixdata)
+res.pcamix <- PCAmix(X.quanti = X1, X.quali = X2, 
+                     graph = TRUE,
+                     ndim = 5,
+                     rename.level = TRUE)
+print(res.pcamix$eig)
+
+print(res.pcamix$sqload)
+
+plot(res.pcamix$eig[,1], type="b", 
+     xlab="Component number", 
+     ylab="Eigenvalues",
+     main="Scree Plot")
+
+
+
+
+library(xtable)
+sqload_df <- as.data.frame(res.pcamix$sqload)
+latex_table <- xtable(sqload_df, digits = 4)
+print(latex_table, type = "latex")
+
+```
+Age, SLD013(Sleep hours - weekends), Moderate (Excercise) Time, RIAGEND( Gender), DMDEDUC2( Education Level), ALQ121( How Often Drink Alcohol Bev), DMDMARTZ( Marital status)
+
+
+Variable Selection
+Examination Data
+```{r}
+exam_data<- data %>% select("WTSAF2YR",  "WTMEC2YR", "SDMVSTRA","SDMVPSU",  "BMXWT", "BMXRECUM", "BMXHEAD", "BMXHT", "BMXBMI", "BMXLEG", "BMXARML", "BMXARMC", "BMXWAIST", "BMXHIP", "diabetes", "prediabetes", "nondiabetes")
+exam_data$diabetes_risk <- ifelse(exam_data$diabetes == 1 | exam_data$prediabetes == 1, 1, 0)
+exam_design <- svydesign(
+  id = ~SDMVPSU,
+  strata = ~SDMVSTRA,
+  weights = ~WTMEC2YR,
+  data = exam_data,
+  nest = TRUE
+)
+exam_data<- exam_data %>% select( "WTMEC2YR", "BMXWT", "BMXRECUM", "BMXHEAD", "BMXHT", "BMXBMI", "BMXLEG", "BMXARML", "BMXARMC", "BMXWAIST", "BMXHIP", "diabetes_risk")
+
+
+exam_data<- exam_data %>% select(-"BMXRECUM", -"BMXHEAD")
+exam_data<-na.omit(exam_data)
+#nrow(exam_data)
+```
+Factor Analysis
+```{r}
+library(psych)
+library(GPArotation)
+vars_for_fa <- c("BMXWT", "BMXHT", "BMXLEG", "BMXARML", "BMXARMC", "BMXWAIST", "BMXHIP")
+X <- exam_data[, vars_for_fa]
+
+
+fa.parallel(X, fa="fa", n.iter=100, fm="ml")
+
+fa_fit <- fa(X, 
+            nfactors=3,
+            rotate="varimax",
+            fm="ml")
+#>0.3
+print(fa_fit, cut=.3)
+
+
+
+
+
+library(xtable)
+loadings <- fa_fit$loadings
+loadings <- unclass(loadings)
+loadings[abs(loadings) < 0.3] <- NA
+loadings_df <- data.frame(unclass(loadings))
+latex_table <- xtable(loadings_df, digit=2 ,cut=.3)
+print(latex_table, type = "latex")
+
+```
+
+
+
+
+Data Processing
+```{r}
+data <- data %>%
+  mutate(
+    moderate_time = case_when(
+      PAD790U == "D" ~ PAD790Q *PAD800,
+      PAD790U == "W" ~ PAD790Q *PAD800 /7,
+      PAD790U == "M" ~ PAD790Q *PAD800 /30,
+      PAD790U == "Y" ~ PAD790Q *PAD800 /360,
+      TRUE ~ 0
+    )
+  )
+
+data <- data %>%
+  mutate(DMDMARTZ = case_when(
+    DMDMARTZ %in% c(77, 99) ~ 0,
+    TRUE ~ DMDMARTZ
+  ))
+
+
+data <- data %>%
+  mutate(
+    drinking = case_when(
+      ALQ111 == 1 ~ 1,
+      ALQ111 == 2 ~ 0,
+      ALQ111 == 9 | is.na(ALQ111) ~ 0
+    )
+  )
+
+data <- data %>%
+  mutate(
+    ALQ121 = case_when(
+      ALQ121 == 0 ~ 0,
+      TRUE ~ 1))
+
+
+data <- data %>%
+  mutate(ALQ121 = replace_na(ALQ121, 0))
+
+data$diabetes_risk <- ifelse(data$diabetes == 1 | data$prediabetes == 1, 1, 0)
+
+
+design <- svydesign(
+    id = ~SDMVPSU,
+    strata = ~SDMVSTRA,
+    weights = ~WTMEC2YR,
+    data = data,
+    nest = TRUE
+)
+
+
+processed_data<- data %>% select("diabetes_risk", "age", "RIAGENDR", "SLD013", "ALQ121", "DMDMARTZ", "BMXHT", "BMXWT", "BMXHIP", "moderate_time", "SDMVPSU", "SDMVSTRA","WTMEC2YR")
+processed_data<-na.omit(processed_data)
+#head(processed_data)
+
+```
+
+
+
+
+Data Processing and Train/ Test Set Split
+```{r}
+#split dataset
+processed_data <- na.omit(processed_data)
+#nrow(interview_data)
+set.seed(1000)
+train_index <- sample(1:nrow(processed_data), 0.8 * nrow(processed_data))
+
+
+
+train_data <- processed_data[train_index, ]
+test_data <- processed_data[-train_index, ]
+train_weights <- weights[train_index]
+test_weights <- weights[-train_index]
+
+
+
+```
+
+
+
+Model Construction
+Logistics Regression
+```{r}
+#head(train_data)
+
+lr_train_data <- train_data %>%
+  mutate(BMXWT = BMXWT, BMXHT = BMXHT, BMXHIP = BMXHIP, age = age, SLD013 = SLD013, moderate_time = moderate_time, 
+         ALQ121 = as.factor(ALQ121), RIAGENDR = as.factor(RIAGENDR), DMDMARTZ = as.factor(DMDMARTZ), SDMVPSU=SDMVPSU, 
+         WTMEC2YR=WTMEC2YR, SDMVSTRA=SDMVSTRA)
+
+lr_train_design <- svydesign(
+  id = ~SDMVPSU,
+  strata = ~SDMVSTRA,
+  weights = ~WTMEC2YR,
+  data = lr_train_data,
+  nest = TRUE
+)
+
+model_logistic <- svyglm(diabetes_risk ~ BMXWT+ BMXHT+ BMXHIP+ age + SLD013+ moderate_time+  ALQ121 + RIAGENDR + DMDMARTZ  ,
+                         data = lr_train_data,
+                         design = lr_train_design,
+                         family = quasibinomial())
+
+
+#summary(model_logistic)
+
+# model_summary <- summary(model_logistic)
+# latex_table <- xtable(model_summary)
+# print(latex_table, 
+#       type = "latex")
+# 
+
+lr_test_data <- test_data %>%
+  mutate(BMXWT = BMXWT, BMXHT = BMXHT, BMXHIP = BMXHIP, age = age, SLD013 = SLD013, moderate_time = moderate_time, 
+         ALQ121 = as.factor(ALQ121), RIAGENDR = as.factor(RIAGENDR), DMDMARTZ = as.factor(DMDMARTZ), SDMVPSU=SDMVPSU, 
+         WTMEC2YR=WTMEC2YR, SDMVSTRA=SDMVSTRA)
+
+
+```
+
+
+SVM
+```{r}
+
+svm_train_data <- train_data %>%
+  mutate(BMXWT = scale(BMXWT), BMXHT = scale(BMXHT), BMXHIP = scale(BMXHIP), age = scale(age), SLD013 = scale(SLD013), moderate_time = scale(moderate_time), 
+         ALQ121 = as.factor(ALQ121), RIAGENDR = as.factor(RIAGENDR), DMDMARTZ = as.factor(DMDMARTZ),
+         SDMVPSU=SDMVPSU, WTMEC2YR=WTMEC2YR, SDMVSTRA=SDMVSTRA)
+
+
+svm_model<-svm(diabetes_risk~.,data=svm_train_data,kernel="radial")
+
+svm_test_data <- train_data %>%
+  mutate(BMXWT = scale(BMXWT), BMXHT = scale(BMXHT), BMXHIP = scale(BMXHIP), age = scale(age), SLD013 = scale(SLD013), moderate_time = scale(moderate_time), 
+         ALQ121 = as.factor(ALQ121), RIAGENDR = as.factor(RIAGENDR), DMDMARTZ = as.factor(DMDMARTZ),
+         SDMVPSU=SDMVPSU, WTMEC2YR=WTMEC2YR, SDMVSTRA=SDMVSTRA)
+svm_test_design <- svydesign(
+  id = ~SDMVPSU,
+  strata = ~SDMVSTRA,
+  weights = ~WTMEC2YR,
+  data = svm_test_data,
+  nest = TRUE
+)
+
+
+
+
+
+```
+
+
+
+XGBOOST
+```{r}
+xgb_train_data <- train_data %>%
+  mutate(BMXWT = as.numeric(BMXWT), BMXHT = as.numeric(BMXHT), BMXHIP = as.numeric(BMXHIP), age = as.numeric(age), SLD013 = as.numeric(SLD013), moderate_time = as.numeric(moderate_time), 
+         ALQ121 = as.numeric(as.factor(ALQ121)), RIAGENDR = as.numeric(as.factor(RIAGENDR)), DMDMARTZ = as.numeric(as.factor(DMDMARTZ)),
+         SDMVPSU=SDMVPSU, WTMEC2YR=WTMEC2YR, SDMVSTRA=SDMVSTRA)
+
+
+
+
+train_matrix <- as.matrix(xgb_train_data[, !(names(xgb_train_data) %in% c("diabetes_risk", "WTMEC2YR", "SDMVPSU", "SDMVSTRA"))])
+train_label <- xgb_train_data$diabetes_risk
+train_weight <- xgb_train_data$WTMEC2YR
+train_weight <- train_weight / mean(train_weight) 
+
+dtrain <- xgb.DMatrix(
+  data = train_matrix, 
+  label = train_label,
+  weight = train_weight
+)
+
+
+params <- list(
+  objective = "binary:logistic",
+  eval_metric = "auc",
+  max_depth = 3,
+  eta = 0.1,
+  subsample= 0.8,
+  colsample_bytree=0.9,
+  min_child_weight=1,
+  gamma = 0.1
+)
+
+
+
+# xgb_model <- xgb.train(
+#   params = params,
+#   data = dtrain,
+#   nrounds = 100,
+#   watchlist = list(train = dtrain),
+#   early_stopping_rounds = 10,
+#   print_every_n = 10
+# )
+
+
+
+
+
+
+
+
+
+
+xgb_test_data <- test_data %>%
+  mutate(BMXWT = as.numeric(BMXWT), BMXHT = as.numeric(BMXHT), BMXHIP = as.numeric(BMXHIP), age = as.numeric(age), SLD013 = as.numeric(SLD013), moderate_time = as.numeric(moderate_time), 
+         ALQ121 = as.numeric(as.factor(ALQ121)), RIAGENDR = as.numeric(as.factor(RIAGENDR)), DMDMARTZ = as.numeric(as.factor(DMDMARTZ)),
+         SDMVPSU=SDMVPSU, WTMEC2YR=WTMEC2YR, SDMVSTRA=SDMVSTRA)
+
+test_matrix <- as.matrix(xgb_test_data[, !(names(xgb_test_data) %in% c("diabetes_risk", "WTMEC2YR", "SDMVPSU", "SDMVSTRA"))])
+test_label <- xgb_test_data$diabetes_risk
+test_weight <- xgb_test_data$WTMEC2YR
+test_weight <- test_weight / mean(test_weight) 
+dtest <- xgb.DMatrix(
+  data = test_matrix, 
+  label = test_label,
+  weight = test_weight
+)
+xgb_model <- xgb.train(
+  params = params,
+  data = dtrain,
+  nrounds = 100,
+  watchlist = list(train = dtrain, test = dtest),
+  early_stopping_rounds = 10
+)
+
+
+test_pred <- predict(xgb_model, dtest)
+
+
+
+```
+
+
+
+
+test ROC&AUC
+```{r}
+#LR
+lr_pred_prob <- predict(model_logistic, lr_test_data,  type = "response")
+lr_roc_obj <- roc(lr_test_data$diabetes_risk ~ lr_pred_prob)
+
+
+par(pty="s") 
+
+coords <- coords(lr_roc_obj, "all")
+plot(1-coords$specificity, coords$sensitivity,
+     type="l", 
+     xlim=c(0,1), 
+     ylim=c(0,1),
+     col="red",
+     lwd=2,
+     main="ROC Curve",
+     xlab="1-Specificity",
+     ylab="Sensitivity")
+
+abline(0, 1, col="gray", lty=2)
+
+legend("bottomright",
+       legend = c(paste("Testing (AUC =", round(auc(lr_roc_obj), 3), ")")),
+       col = "red",
+       lwd = 2)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+#SVM
+svm_pred_prob <- predict(svm_model, svm_test_data,  type = "response")
+
+
+svm_roc_obj <- roc(svm_test_data$diabetes_risk ~ svm_pred_prob)
+
+coords <- coords(svm_roc_obj, "all")
+plot(1-coords$specificity, coords$sensitivity,
+     type="l", 
+     xlim=c(0,1), 
+     ylim=c(0,1),
+     col="red",
+     lwd=2,
+     main="ROC Curve",
+     xlab="1-Specificity",
+     ylab="Sensitivity")
+
+abline(0, 1, col="gray", lty=2)
+
+legend("bottomright",
+       legend = c(paste("Testing (AUC =", round(auc(svm_roc_obj), 3), ")")),
+       col = "red",
+       lwd = 2)
+
+
+
+#xgb
+test_roc <- roc(test_label, test_pred, weights = test_weight)
+
+coords <- coords(test_roc, "all")
+plot(1-coords$specificity, coords$sensitivity,
+     type="l", 
+     xlim=c(0,1), 
+     ylim=c(0,1),
+     col="red",
+     lwd=2,
+     main="ROC Curve",
+     xlab="1-Specificity",
+     ylab="Sensitivity")
+
+abline(0, 1, col="gray", lty=2)
+
+legend("bottomright",
+       legend = c(paste("Testing (AUC =", round(auc(test_roc), 3), ")")),
+       col = "red",
+       lwd = 2)
+
+```
+
+```{r}
+par(pty="s")
+
+coords_lr <- coords(lr_roc_obj, "all")
+plot(1-coords_lr$specificity, coords_lr$sensitivity,
+     type="l", 
+     xlim=c(0,1), 
+     ylim=c(0,1),
+     col="red",
+     lwd=2,
+     main="ROC Curves Comparison",
+     xlab="1-Specificity",
+     ylab="Sensitivity")
+
+coords_svm <- coords(svm_roc_obj, "all")
+lines(1-coords_svm$specificity, coords_svm$sensitivity,
+      col="blue",
+      lwd=2)
+
+coords_xgb <- coords(test_roc, "all")
+lines(1-coords_xgb$specificity, coords_xgb$sensitivity,
+      col="green",
+      lwd=2)
+
+abline(0, 1, col="gray", lty=2)
+
+legend("bottomright",
+       legend = c(
+           paste("LR (AUC =", round(auc(lr_roc_obj), 3), ")"),
+           paste("SVM (AUC =", round(auc(svm_roc_obj), 3), ")"),
+           paste("XGB (AUC =", round(auc(test_roc), 3), ")")
+       ),
+       col = c("red", "blue", "green"),
+       lwd = 2)
+```
+
+
+
