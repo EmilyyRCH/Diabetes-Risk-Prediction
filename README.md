@@ -146,7 +146,6 @@ The final selected model was an **SVM using seven features selected through Rand
 
 | Metric            |              Final SVM |
 | ----------------- | ---------------------: |
-| Model             | Support Vector Machine |
 | Selected Features |                      7 |
 | AUC               |               **0.86** |
 | Recall            |                **91%** |
